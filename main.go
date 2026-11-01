@@ -7,30 +7,25 @@ import (
 	"net"
 	"strings"
 	"time"
-	"uuid"
 )
 
-// Everything is big endian
-// Header (12 bytes): 6 uint16
-// ID (verify req and resp id) |
-// Flags (QR 1 OPCODE 4 AA 1 TC 1 RD 1 RA 1 ZZZ 3 RCODE 4)
-// qr 0 is query 1 is response aa is authoritative answer
-// tc is response was truncated, rd is recursion desired
-// ra is server supports recursion rcode 0 is success, 3 = nxdomain |
-// QDCOUNT | ANCOUNT | NSCOUNT | ARCOUNT
-// DNS Packet structure:
-// Header: 12 bytes
-// Questions: QDCOUNT
-// Answers: ANCOUNT
-// Authority: NSCOUNT
-// Additional: ARCOUNT
-
-type Query struct {
-	Header   []uint16 //
-	Question string
-	// Name     string
-	ID uuid.UUID
-}
+// Everything is big endian.
+//
+// DNS message:
+//   Header:     12 bytes
+//   Questions:  QDCOUNT entries
+//   Answers:    ANCOUNT resource records
+//   Authority:  NSCOUNT resource records
+//   Additional: ARCOUNT resource records
+//
+// Header (6 x uint16): ID | Flags | QDCOUNT | ANCOUNT | NSCOUNT | ARCOUNT
+// Flags: QR(1) OPCODE(4) AA(1) TC(1) RD(1) RA(1) Z(3) RCODE(4)
+//   QR 0 = query, 1 = response; AA = authoritative answer
+//   TC = truncated; RD = recursion desired; RA = recursion available
+//   RCODE 0 = success, 3 = NXDOMAIN
+//
+// Question: QNAME | QTYPE (2) | QCLASS (2)
+// Resource record: NAME | TYPE (2) | CLASS (2) | TTL (4) | RDLENGTH (2) | RDATA
 
 const (
 	TypeA     = 1
@@ -49,47 +44,31 @@ func NewQuery(name string, qtype uint16, recurse bool) ([]byte, uint16, error) {
 
 	id := uint16(rand.Uint32())
 
-	header := make([]byte, 12, 512)
+	msg := make([]byte, 12, 512)
 
-	// id
-	binary.BigEndian.PutUint16(header[0:2], id)
+	binary.BigEndian.PutUint16(msg[0:2], id)
 
-	// flags: 0x100 if recurse, else 0
-	var flag uint16
+	var flags uint16
 	if recurse {
-		flag = 0x100
-	} else {
-		flag = 0
+		flags = flagRD
 	}
-	binary.BigEndian.PutUint16(header[2:4], flag)
+	binary.BigEndian.PutUint16(msg[2:4], flags)
 
-	// qdcount
-	binary.BigEndian.PutUint16(header[4:6], 1)
+	// qdcount: one question. Bytes 6-11 (an/ns/ar counts) stay 0.
+	binary.BigEndian.PutUint16(msg[4:6], 1) // rd flag set
 
-	// now we dont give a fuck about 6-11 bytes rn
-	// bytes 6-11 left as 0 (no answer, authority, additional records)
-	// header is finished here
-	// TODO: rename header var to msg
+	// question: qname, qtype, qclass
+	msg = append(msg, encodedName...)
+	msg = binary.BigEndian.AppendUint16(msg, qtype)
+	msg = binary.BigEndian.AppendUint16(msg, 1) // IN (internet)
 
-	// now we append the question: qname, qtype, qclass
-
-	// this is variable size
-	header = append(header, encodedName...)
-
-	header = binary.BigEndian.AppendUint16(header, uint16(qtype))
-
-	// almost always a 1. IN for internet
-	header = binary.BigEndian.AppendUint16(header, uint16(1))
-
-	return header, id, nil
+	return msg, id, nil
 }
 
 // human-readable name into dns wire format: len label len label 0
 // allowed: meow.example.com, ".", ""
 // not allowed: a..b
 func encodeName(name string) ([]byte, error) {
-	// reject empty labels and labels over 63 bytes
-
 	name = strings.TrimSuffix(name, ".")
 	if name == "" {
 		return []byte{0}, nil
@@ -119,20 +98,6 @@ func encodeName(name string) ([]byte, error) {
 	return result, nil
 }
 
-// func decodeName(msg []byte, off int) (string, int, error) {
-// 	// length byte 0 ends the name
-// 	// 0xc0 bits set means a pointer
-// 	// anything else: normal label
-//
-// 	// returned offset is the one after the first pointer
-// 	// also cap the jump cnt
-//
-// 	// for the example packet
-// 	// at offset 12 it should return example.com. and next offset 25
-// 	// at offset 29
-// 	//
-// }
-
 type Header struct {
 	ID      uint16
 	Flags   uint16
@@ -143,7 +108,6 @@ type Header struct {
 }
 
 func parseHeader(msg []byte) (Header, error) {
-	// means no valid header since header of dns is 12 bytes
 	if len(msg) < 12 {
 		return Header{}, fmt.Errorf("message too short")
 	}
@@ -160,12 +124,10 @@ func parseHeader(msg []byte) (Header, error) {
 	return h, nil
 }
 
-// func parseRR(qname string, qtype uint16, qclass uint16, ttl int, rdlength) {
-//
-// }
-// initial offset 12 ofc
+// decodeName reads a (possibly compressed) name starting at off.
+// It returns the name and the offset of the first byte after the name
+// in the original position, i.e. not wherever a pointer sent us.
 func decodeName(msg []byte, off int) (string, int, error) {
-	// labels are the text parts of a domain name
 	var labels []string
 	next := -1
 	jumps := 0
@@ -174,7 +136,7 @@ func decodeName(msg []byte, off int) (string, int, error) {
 		if off >= len(msg) {
 			return "", 0, fmt.Errorf("offset is greater than the message length")
 		}
-		length := int(msg[off]) // read the length byte
+		length := int(msg[off])
 
 		switch {
 		// end of name
@@ -185,12 +147,12 @@ func decodeName(msg []byte, off int) (string, int, error) {
 			}
 			return strings.Join(labels, ".") + ".", next, nil
 
-		case length&0xC0 == 0xc0: // pointer
+		case length&0xC0 == 0xC0: // pointer
 			if off+1 >= len(msg) {
 				return "", 0, fmt.Errorf("truncated pointer")
 			}
 
-			ptr := (length&0x3f)<<8 | int(msg[off+1])
+			ptr := (length&0x3F)<<8 | int(msg[off+1])
 			if next == -1 {
 				next = off + 2
 			}
@@ -200,7 +162,7 @@ func decodeName(msg []byte, off int) (string, int, error) {
 			}
 			off = ptr
 
-		case length&0xc0 != 0: // 01 or 10 prefix: not allowed
+		case length&0xC0 != 0: // 01 or 10 prefix: not allowed
 			return "", 0, fmt.Errorf("bad label prefix")
 
 		default:
@@ -214,50 +176,140 @@ func decodeName(msg []byte, off int) (string, int, error) {
 	}
 }
 
-func parseQuestion(qname string, qtype uint16, qclass uint16) {
+type Question struct {
+	Name  string
+	Type  uint16
+	Class uint16
+}
 
+// parseQuestion reads one question starting at off and returns it along
+// with the offset of the byte after it.
+func parseQuestion(msg []byte, off int) (Question, int, error) {
+	name, off, err := decodeName(msg, off)
+	if err != nil {
+		return Question{}, 0, fmt.Errorf("question name: %w", err)
+	}
+
+	// qtype + qclass = 4 bytes
+	if off+4 > len(msg) {
+		return Question{}, 0, fmt.Errorf("question truncated")
+	}
+
+	q := Question{
+		Name:  name,
+		Type:  binary.BigEndian.Uint16(msg[off : off+2]),
+		Class: binary.BigEndian.Uint16(msg[off+2 : off+4]),
+	}
+	return q, off + 4, nil
+}
+
+type Record struct {
+	Name  string
+	Type  uint16
+	Class uint16
+	TTL   uint32
+	RData []byte // raw for now; decoding per type comes next
+}
+
+// www.example.com.
+// 3www7example3com0
+//
+//	1100000 00000000
+//
+// 0xc0  0x0c
+// c00c
+//
+// parseRR reads one resource record starting at off and returns it along
+// with the offset of the byte after it.
+func parseRR(msg []byte, off int) (Record, int, error) {
+	name, off, err := decodeName(msg, off)
+	if err != nil {
+		return Record{}, 0, fmt.Errorf("record name: %w", err)
+	}
+
+	// type(2) + class(2) + ttl(4) + rdlength(2) = 10 fixed bytes
+	if off+10 > len(msg) {
+		return Record{}, 0, fmt.Errorf("record header truncated")
+	}
+
+	rr := Record{
+		Name:  name,
+		Type:  binary.BigEndian.Uint16(msg[off : off+2]),
+		Class: binary.BigEndian.Uint16(msg[off+2 : off+4]),
+		TTL:   binary.BigEndian.Uint32(msg[off+4 : off+8]),
+	}
+	rdlen := int(binary.BigEndian.Uint16(msg[off+8 : off+10]))
+	off += 10
+
+	if off+rdlen > len(msg) {
+		return Record{}, 0, fmt.Errorf("rdata runs past end of message")
+	}
+	rr.RData = msg[off : off+rdlen]
+
+	return rr, off + rdlen, nil
 }
 
 func main() {
 	conn, err := net.Dial("udp", "1.1.1.1:53")
-	if err := conn.SetDeadline(time.Now().Add(time.Second * 2)); err != nil {
+	if err != nil {
+		fmt.Println("failed to dial:", err)
+		return
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		fmt.Println("failed to set deadline:", err)
 		return
 	}
 
-	defer conn.Close()
-
-	header, _, err := NewQuery("example.com", TypeA, true)
+	query, _, err := NewQuery("example.com", TypeA, true)
 	if err != nil {
-		fmt.Printf("failed to create query: %v", err)
+		fmt.Println("failed to create query:", err)
 		return
 	}
 
-	conn.Write(header)
+	// write this query to the socket
+	if _, err := conn.Write(query); err != nil {
+		fmt.Println("failed to send query:", err)
+		return
+	}
 
 	buf := make([]byte, 4096)
+
+	// read the reply
 	n, err := conn.Read(buf)
+	if err != nil {
+		fmt.Println("failed to read response:", err)
+		return
+	}
 	resp := buf[:n]
 
-	fmt.Printf("% x\n", header)
-	fmt.Printf("% x\n", resp)
+	h, err := parseHeader(resp)
+	if err != nil {
+		fmt.Println("bad header:", err)
+		return
+	}
+	fmt.Printf("%+v\n", h)
 
-	// res := []byte{
-	// 	0x2f, 0x3c, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
-	// 	0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00,
-	// 	0x00, 0x01, 0x00, 0x01,
-	// 	0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0xc7, 0x00, 0x04, 0x68, 0x14, 0x17, 0x9a,
-	// 	0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0xc7, 0x00, 0x04, 0xac, 0x42, 0x93, 0xf3,
-	// } // h, _ := parseHeader(res)
-	// fmt.Printf("%+v\n", h)
-	// bad := []byte{0xc0, 0x00}
-	// name, next, err := decodeName(bad, 0)
-	// fmt.Printf("%q %d %v\n", name, next, err)
-	// "" 0 too many pointer jumps
-	//
-	// name, _, err := decodeName(res, 27)
-	bad2 := []byte{0xc0, 0x02, 0xc0, 0x00}
-	_, _, err = decodeName(bad2, 0)
-	fmt.Println(err) // too many pointer jumps
-	// fmt.Println(name)
+	off := 12
+	for i := 0; i < int(h.QDCount); i++ {
+		var q Question
+		q, off, err = parseQuestion(resp, off)
+		if err != nil {
+			fmt.Println("bad question:", err)
+			return
+		}
+		fmt.Printf("question: %+v\n", q)
+	}
+
+	for i := 0; i < int(h.ANCount); i++ {
+		var rr Record
+		rr, off, err = parseRR(resp, off)
+		if err != nil {
+			fmt.Println("bad answer:", err)
+			return
+		}
+		fmt.Printf("answer: %s type=%d class=%d ttl=%d rdata=% x\n",
+			rr.Name, rr.Type, rr.Class, rr.TTL, rr.RData)
+	}
 }
