@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"os"
 	"strings"
 	"time"
 )
@@ -208,17 +209,75 @@ type Record struct {
 	Type  uint16
 	Class uint16
 	TTL   uint32
-	RData []byte // raw for now; decoding per type comes next
+	RData []byte // raw bytes as they came off the wire
+	Data  string // RData decoded to readable form, depending on Type
 }
 
-// www.example.com.
-// 3www7example3com0
-//
-//	1100000 00000000
-//
-// 0xc0  0x0c
-// c00c
-//
+func typeName(t uint16) string {
+	switch t {
+	case TypeA:
+		return "A"
+	case TypeNS:
+		return "NS"
+	case TypeCNAME:
+		return "CNAME"
+	case TypeMX:
+		return "MX"
+	case TypeAAAA:
+		return "AAAA"
+	}
+	return fmt.Sprintf("TYPE%d", t)
+}
+
+// decodeRData turns the rdlen bytes of rdata at msg[off:] into readable text.
+// It takes the whole message, not just the rdata slice, because names inside
+// rdata (NS, CNAME, MX) may be compression pointers back into the message.
+func decodeRData(msg []byte, typ uint16, off, rdlen int) (string, error) {
+	end := off + rdlen
+
+	switch typ {
+	case TypeA:
+		if rdlen != 4 {
+			return "", fmt.Errorf("A rdata is %d bytes, want 4", rdlen)
+		}
+		return net.IP(msg[off:end]).String(), nil
+
+	case TypeAAAA:
+		if rdlen != 16 {
+			return "", fmt.Errorf("AAAA rdata is %d bytes, want 16", rdlen)
+		}
+		return net.IP(msg[off:end]).String(), nil
+
+	case TypeNS, TypeCNAME:
+		name, next, err := decodeName(msg, off)
+		if err != nil {
+			return "", err
+		}
+		if next > end {
+			return "", fmt.Errorf("name runs past end of rdata")
+		}
+		return name, nil
+
+	case TypeMX:
+		// preference (2 bytes), then the mail server's name
+		if rdlen < 3 {
+			return "", fmt.Errorf("MX rdata too short")
+		}
+		pref := binary.BigEndian.Uint16(msg[off : off+2])
+		name, next, err := decodeName(msg, off+2)
+		if err != nil {
+			return "", err
+		}
+		if next > end {
+			return "", fmt.Errorf("name runs past end of rdata")
+		}
+		return fmt.Sprintf("%d %s", pref, name), nil
+	}
+
+	// unknown type: keep the bytes visible instead of failing
+	return fmt.Sprintf("% x", msg[off:end]), nil
+}
+
 // parseRR reads one resource record starting at off and returns it along
 // with the offset of the byte after it.
 func parseRR(msg []byte, off int) (Record, int, error) {
@@ -246,70 +305,121 @@ func parseRR(msg []byte, off int) (Record, int, error) {
 	}
 	rr.RData = msg[off : off+rdlen]
 
+	rr.Data, err = decodeRData(msg, rr.Type, off, rdlen)
+	if err != nil {
+		return Record{}, 0, fmt.Errorf("%s rdata: %w", typeName(rr.Type), err)
+	}
+
+	// always trust rdlen for where the next record starts
 	return rr, off + rdlen, nil
 }
 
-func main() {
-	conn, err := net.Dial("udp", "1.1.1.1:53")
+const usage = "usage: quarry <name> [A|AAAA|NS|CNAME|MX] [@server]"
+
+var typeNums = map[string]uint16{
+	"A":     TypeA,
+	"NS":    TypeNS,
+	"CNAME": TypeCNAME,
+	"MX":    TypeMX,
+	"AAAA":  TypeAAAA,
+}
+
+// parseArgs understands: quarry <name> [TYPE] [@server]
+// The type and server are optional and may come in any order.
+func parseArgs(args []string) (name string, qtype uint16, server string, err error) {
+	qtype = TypeA
+	server = "1.1.1.1"
+
+	for _, a := range args {
+		if s, ok := strings.CutPrefix(a, "@"); ok {
+			server = s
+		} else if t, ok := typeNums[strings.ToUpper(a)]; ok {
+			qtype = t
+		} else if name == "" {
+			name = a
+		} else {
+			return "", 0, "", fmt.Errorf("unexpected argument %q", a)
+		}
+	}
+
+	if name == "" {
+		return "", 0, "", fmt.Errorf("missing name")
+	}
+
+	// no port given: use the standard DNS port
+	if _, _, err := net.SplitHostPort(server); err != nil {
+		server = net.JoinHostPort(server, "53")
+	}
+	return name, qtype, server, nil
+}
+
+func run(name string, qtype uint16, server string) error {
+	conn, err := net.Dial("udp", server)
 	if err != nil {
-		fmt.Println("failed to dial:", err)
-		return
+		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
 
 	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		fmt.Println("failed to set deadline:", err)
-		return
+		return fmt.Errorf("set deadline: %w", err)
 	}
 
-	query, _, err := NewQuery("example.com", TypeA, true)
+	query, _, err := NewQuery(name, qtype, true)
 	if err != nil {
-		fmt.Println("failed to create query:", err)
-		return
+		return err
 	}
 
-	// write this query to the socket
 	if _, err := conn.Write(query); err != nil {
-		fmt.Println("failed to send query:", err)
-		return
+		return fmt.Errorf("send query: %w", err)
 	}
 
 	buf := make([]byte, 4096)
-
-	// read the reply
 	n, err := conn.Read(buf)
 	if err != nil {
-		fmt.Println("failed to read response:", err)
-		return
+		return fmt.Errorf("read response: %w", err)
 	}
 	resp := buf[:n]
 
 	h, err := parseHeader(resp)
 	if err != nil {
-		fmt.Println("bad header:", err)
-		return
+		return fmt.Errorf("header: %w", err)
 	}
-	fmt.Printf("%+v\n", h)
 
+	// skip past the question(s) to reach the answers
 	off := 12
 	for i := 0; i < int(h.QDCount); i++ {
-		var q Question
-		q, off, err = parseQuestion(resp, off)
+		_, off, err = parseQuestion(resp, off)
 		if err != nil {
-			fmt.Println("bad question:", err)
-			return
+			return fmt.Errorf("question: %w", err)
 		}
-		fmt.Printf("question: %+v\n", q)
+	}
+
+	if h.ANCount == 0 {
+		fmt.Fprintf(os.Stderr, "no answers (rcode %d)\n", h.Flags&0xF)
+		return nil
 	}
 
 	for i := 0; i < int(h.ANCount); i++ {
 		var rr Record
 		rr, off, err = parseRR(resp, off)
 		if err != nil {
-			fmt.Println("bad answer:", err)
-			return
+			return fmt.Errorf("answer: %w", err)
 		}
-		fmt.Printf("answer: %s type=%d class=%d ttl=%d rdata=% x\n",
-			rr.Name, rr.Type, rr.Class, rr.TTL, rr.RData)
+		fmt.Printf("%s\t%d\t%s\t%s\n", rr.Name, rr.TTL, typeName(rr.Type), rr.Data)
+	}
+	return nil
+}
+
+func main() {
+	name, qtype, server, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usage)
+		os.Exit(2)
+	}
+
+	if err := run(name, qtype, server); err != nil {
+		fmt.Fprintln(os.Stderr, "quarry:", err)
+		os.Exit(1)
 	}
 }
